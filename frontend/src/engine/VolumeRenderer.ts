@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { DataBlock, VolumeRenderSettings, SEGYHeader } from '../types';
 import { ColormapManager } from './ColormapManager';
 import { OctreeScheduler } from './OctreeScheduler';
+import { resourceManager } from '../utils/ResourceManager';
 
 const vertexShader = `
 uniform mat4 modelViewMatrix;
@@ -146,6 +147,12 @@ export interface VolumeRendererOptions {
   settings?: Partial<VolumeRenderSettings>;
 }
 
+interface TrackedGLResource {
+  id: string;
+  type: 'texture' | 'geometry' | 'material' | 'renderer' | 'buffer';
+  object: any;
+}
+
 export class VolumeRenderer {
   private container: HTMLElement;
   private scene!: THREE.Scene;
@@ -159,21 +166,29 @@ export class VolumeRenderer {
   private volumeTexture: THREE.Data3DTexture | null = null;
   private colormapTexture: THREE.DataTexture | null = null;
   
+  private trackedResources: Map<string, TrackedGLResource> = new Map();
   private colormapManager: ColormapManager;
   private octreeScheduler: OctreeScheduler;
   
   private settings: VolumeRenderSettings;
   private header: SEGYHeader | null = null;
   private volumeData: Float32Array | null = null;
+  private volumeDataResourceId: string | null = null;
   private volumeDimensions: { width: number; height: number; depth: number } = { width: 0, height: 0, depth: 0 };
   private valueRange: { min: number; max: number } = { min: 0, max: 1 };
   
   private blocks: Map<string, DataBlock> = new Map();
+  private groupId: string;
+  private isDisposed = false;
+  private isClearing = false;
+  
+  private lights: THREE.Light[] = [];
   
   constructor(options: VolumeRendererOptions) {
     this.container = options.container;
     this.colormapManager = new ColormapManager();
-    this.octreeScheduler = new OctreeScheduler();
+    this.groupId = `renderer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    this.octreeScheduler = new OctreeScheduler(this.groupId);
     
     this.settings = {
       colormap: options.settings?.colormap || this.colormapManager.getDefaultColormap(),
@@ -184,12 +199,15 @@ export class VolumeRenderer {
       threshold: options.settings?.threshold || 0.0,
     };
     
+    resourceManager.registerCleanupHook(`renderer_${this.groupId}`, () => this.dispose());
     this.init();
   }
   
   private init(): void {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0a0a0f);
+    
+    resourceManager.track(this.scene, 'THREE.Scene', 0, this.groupId, 'Main scene');
     
     const { clientWidth, clientHeight } = this.container;
     
@@ -200,15 +218,18 @@ export class VolumeRenderer {
       10000
     );
     this.camera.position.set(100, 100, 100);
+    resourceManager.track(this.camera, 'THREE.Camera', 0, this.groupId, 'Main camera');
     
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: true,
       powerPreference: 'high-performance',
+      preserveDrawingBuffer: false,
     });
     this.renderer.setSize(clientWidth, clientHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.sortObjects = false;
+    this.trackResource(this.renderer, 'renderer', 'Main WebGLRenderer');
     
     this.container.appendChild(this.renderer.domElement);
     
@@ -216,6 +237,7 @@ export class VolumeRenderer {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
     this.controls.maxPolarAngle = Math.PI / 2.1;
+    resourceManager.track(this.controls, 'OrbitControls', 0, this.groupId, 'Camera controls');
     
     this.setupLights();
     this.setupColormapTexture();
@@ -226,14 +248,23 @@ export class VolumeRenderer {
   private setupLights(): void {
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
     this.scene.add(ambientLight);
+    this.lights.push(ambientLight);
+    resourceManager.track(ambientLight, 'THREE.AmbientLight', 0, this.groupId, 'Ambient light');
     
     const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
     directionalLight.position.set(1, 1, 1);
     this.scene.add(directionalLight);
+    this.lights.push(directionalLight);
+    resourceManager.track(directionalLight, 'THREE.DirectionalLight', 0, this.groupId, 'Directional light');
   }
   
   private setupColormapTexture(): void {
     const colormapData = this.colormapManager.createColormapTexture(this.settings.colormap);
+    
+    if (this.colormapTexture) {
+      this.disposeTexture(this.colormapTexture);
+    }
+    
     this.colormapTexture = new THREE.DataTexture(
       colormapData as any,
       256,
@@ -242,6 +273,7 @@ export class VolumeRenderer {
       THREE.UnsignedByteType
     );
     this.colormapTexture.needsUpdate = true;
+    this.trackResource(this.colormapTexture, 'texture', 'Colormap texture');
   }
   
   private setupEventListeners(): void {
@@ -249,6 +281,8 @@ export class VolumeRenderer {
   }
   
   private handleResize = (): void => {
+    if (this.isDisposed) return;
+    
     const { clientWidth, clientHeight } = this.container;
     
     this.camera.aspect = clientWidth / clientHeight;
@@ -258,6 +292,8 @@ export class VolumeRenderer {
   };
   
   private animate = (): void => {
+    if (this.isDisposed) return;
+    
     this.animationFrameId = requestAnimationFrame(this.animate);
     this.controls.update();
     this.updateUniforms();
@@ -265,23 +301,165 @@ export class VolumeRenderer {
   };
   
   private render(): void {
-    this.renderer.render(this.scene, this.camera);
+    if (this.isDisposed || this.isClearing) return;
+    
+    try {
+      this.renderer.render(this.scene, this.camera);
+    } catch (error) {
+      console.error('[VolumeRenderer] Render error:', error);
+    }
   }
   
   private updateUniforms(): void {
-    if (!this.volumeMaterial) return;
+    if (!this.volumeMaterial || this.isDisposed) return;
     
-    const uniforms = this.volumeMaterial.uniforms;
+    try {
+      const uniforms = this.volumeMaterial.uniforms;
+      
+      uniforms.uCameraPos.value.copy(this.camera.position);
+      uniforms.uSampleRate.value = this.settings.sampleRate;
+      uniforms.uOpacity.value = this.settings.opacity;
+      uniforms.uBrightness.value = this.settings.brightness;
+      uniforms.uContrast.value = this.settings.contrast;
+      uniforms.uThreshold.value = this.settings.threshold;
+    } catch (error) {
+      console.error('[VolumeRenderer] Uniform update error:', error);
+    }
+  }
+  
+  private trackResource(object: any, type: TrackedGLResource['type'], description?: string): string {
+    const id = `gl_${type}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
-    uniforms.uCameraPos.value.copy(this.camera.position);
-    uniforms.uSampleRate.value = this.settings.sampleRate;
-    uniforms.uOpacity.value = this.settings.opacity;
-    uniforms.uBrightness.value = this.settings.brightness;
-    uniforms.uContrast.value = this.settings.contrast;
-    uniforms.uThreshold.value = this.settings.threshold;
+    let size = 0;
+    if (type === 'texture' && object.image?.data) {
+      size = object.image.data.byteLength || 0;
+    }
+    
+    this.trackedResources.set(id, { id, type, object });
+    resourceManager.track(object, `THREE.${type.charAt(0).toUpperCase() + type.slice(1)}`, size, this.groupId, description);
+    
+    return id;
+  }
+  
+  private disposeTexture(texture: THREE.Texture): void {
+    try {
+      if (texture.image?.data) {
+        if (texture.image.data.buffer && typeof texture.image.data.buffer.transfer === 'function') {
+          texture.image.data.buffer.transfer();
+        }
+      }
+      texture.dispose();
+    } catch (error) {
+      console.warn('[VolumeRenderer] Texture dispose warning:', error);
+    }
+    
+    for (const [id, res] of this.trackedResources) {
+      if (res.object === texture) {
+        this.trackedResources.delete(id);
+        resourceManager.untrack(id);
+        break;
+      }
+    }
+  }
+  
+  private disposeGeometry(geometry: THREE.BufferGeometry): void {
+    try {
+      for (const key of Object.keys(geometry.attributes)) {
+        const attr = geometry.attributes[key];
+        const buffer = attr.array?.buffer as any;
+        if (buffer && typeof buffer.transfer === 'function') {
+          buffer.transfer();
+        }
+      }
+      geometry.dispose();
+    } catch (error) {
+      console.warn('[VolumeRenderer] Geometry dispose warning:', error);
+    }
+    
+    for (const [id, res] of this.trackedResources) {
+      if (res.object === geometry) {
+        this.trackedResources.delete(id);
+        resourceManager.untrack(id);
+        break;
+      }
+    }
+  }
+  
+  private disposeMaterial(material: THREE.Material): void {
+    try {
+      material.dispose();
+    } catch (error) {
+      console.warn('[VolumeRenderer] Material dispose warning:', error);
+    }
+    
+    for (const [id, res] of this.trackedResources) {
+      if (res.object === material) {
+        this.trackedResources.delete(id);
+        resourceManager.untrack(id);
+        break;
+      }
+    }
+  }
+  
+  async clearVolumeData(): Promise<void> {
+    if (this.isClearing) return;
+    this.isClearing = true;
+    
+    try {
+      if (this.volumeMesh) {
+        this.scene.remove(this.volumeMesh);
+        
+        if (this.volumeMesh.geometry) {
+          this.disposeGeometry(this.volumeMesh.geometry);
+        }
+        
+        if (this.volumeMaterial) {
+          this.disposeMaterial(this.volumeMaterial);
+          this.volumeMaterial = null;
+        }
+        
+        this.volumeMesh = null;
+      }
+      
+      if (this.volumeTexture) {
+        this.disposeTexture(this.volumeTexture);
+        this.volumeTexture = null;
+      }
+      
+      if (this.volumeData) {
+        if (this.volumeDataResourceId) {
+          await resourceManager.dispose(this.volumeDataResourceId, true);
+          this.volumeDataResourceId = null;
+        }
+        const buffer = this.volumeData.buffer as any;
+        if (typeof buffer?.transfer === 'function') {
+          buffer.transfer();
+        }
+        this.volumeData = null;
+      }
+      
+      this.blocks.clear();
+      this.volumeDimensions = { width: 0, height: 0, depth: 0 };
+      this.valueRange = { min: 0, max: 1 };
+      
+      await this.octreeScheduler.dispose();
+      
+      await resourceManager.forceGC();
+      
+      if (this.renderer) {
+        this.renderer.resetState();
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
+    } finally {
+      this.isClearing = false;
+    }
   }
   
   setHeader(header: SEGYHeader): void {
+    if (this.isDisposed) return;
+    
     this.header = header;
     
     const xRange = header.max_x - header.min_x;
@@ -307,6 +485,8 @@ export class VolumeRenderer {
   }
   
   addBlock(block: DataBlock): void {
+    if (this.isDisposed || this.isClearing) return;
+    
     this.blocks.set(block.block_id, block);
     this.updateValueRange(block);
   }
@@ -327,27 +507,46 @@ export class VolumeRenderer {
     depth: number,
     header: SEGYHeader
   ): void {
-    this.volumeData = data;
-    this.volumeDimensions = { width, height, depth };
-    this.header = header;
+    if (this.isDisposed) return;
     
-    let min = Infinity;
-    let max = -Infinity;
-    for (let i = 0; i < data.length; i++) {
-      if (data[i] < min) min = data[i];
-      if (data[i] > max) max = data[i];
-    }
-    this.valueRange = { min, max };
-    
-    this.createVolumeTexture();
-    this.createVolumeMesh();
-    this.updateCameraPosition();
+    this.clearVolumeData().then(() => {
+      if (this.isDisposed) return;
+      
+      this.volumeData = data;
+      this.volumeDimensions = { width, height, depth };
+      this.header = header;
+      
+      this.volumeDataResourceId = resourceManager.track(
+        data,
+        'Float32Array',
+        data.byteLength,
+        this.groupId,
+        `Main volume data: ${width}x${height}x${depth}`
+      );
+      
+      let min = Infinity;
+      let max = -Infinity;
+      const sampleStep = Math.max(1, Math.floor(data.length / 10000));
+      for (let i = 0; i < data.length; i += sampleStep) {
+        if (data[i] < min) min = data[i];
+        if (data[i] > max) max = data[i];
+      }
+      this.valueRange = { min, max };
+      
+      this.createVolumeTexture();
+      this.createVolumeMesh();
+      this.updateCameraPosition();
+    });
   }
   
   private createVolumeTexture(): void {
-    if (!this.volumeData) return;
+    if (!this.volumeData || this.isDisposed) return;
     
     const { width, height, depth } = this.volumeDimensions;
+    
+    if (this.volumeTexture) {
+      this.disposeTexture(this.volumeTexture);
+    }
     
     this.volumeTexture = new THREE.Data3DTexture(
       this.volumeData as any,
@@ -364,18 +563,15 @@ export class VolumeRenderer {
     this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping;
     this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping;
     this.volumeTexture.needsUpdate = true;
+    
+    this.trackResource(this.volumeTexture, 'texture', `Volume 3D texture: ${width}x${height}x${depth}`);
   }
   
   private createVolumeMesh(): void {
-    if (this.volumeMesh) {
-      this.scene.remove(this.volumeMesh);
-      this.volumeMesh.geometry.dispose();
-      if (this.volumeMaterial) {
-        this.volumeMaterial.dispose();
-      }
-    }
+    if (this.isDisposed) return;
     
     const geometry = new THREE.BoxGeometry(1, 1, 1);
+    this.trackResource(geometry, 'geometry', 'Volume box geometry');
     
     const uniforms = {
       uVolumeData: { value: this.volumeTexture },
@@ -407,6 +603,7 @@ export class VolumeRenderer {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
+    this.trackResource(this.volumeMaterial, 'material', 'Volume shader material');
     
     this.volumeMesh = new THREE.Mesh(geometry, this.volumeMaterial);
     
@@ -434,7 +631,7 @@ export class VolumeRenderer {
   }
   
   private updateCameraPosition(): void {
-    if (!this.header || !this.volumeMesh) return;
+    if (!this.header || !this.volumeMesh || this.isDisposed) return;
     
     const box = new THREE.Box3().setFromObject(this.volumeMesh);
     const center = box.getCenter(new THREE.Vector3());
@@ -451,13 +648,17 @@ export class VolumeRenderer {
   }
   
   updateSettings(settings: Partial<VolumeRenderSettings>): void {
+    if (this.isDisposed) return;
+    
     this.settings = { ...this.settings, ...settings };
     
     if (settings.colormap) {
       const colormapData = this.colormapManager.createColormapTexture(settings.colormap);
+      
       if (this.colormapTexture) {
-        this.colormapTexture.dispose();
+        this.disposeTexture(this.colormapTexture);
       }
+      
       this.colormapTexture = new THREE.DataTexture(
         colormapData as any,
         256,
@@ -466,6 +667,7 @@ export class VolumeRenderer {
         THREE.UnsignedByteType
       );
       this.colormapTexture.needsUpdate = true;
+      this.trackResource(this.colormapTexture, 'texture', 'Updated colormap texture');
       
       if (this.volumeMaterial) {
         this.volumeMaterial.uniforms.uColormap.value = this.colormapTexture;
@@ -502,38 +704,86 @@ export class VolumeRenderer {
     return this.colormapManager;
   }
   
+  getGroupId(): string {
+    return this.groupId;
+  }
+  
   resetCamera(): void {
     this.updateCameraPosition();
   }
   
-  dispose(): void {
+  getMemoryUsage(): number {
+    let total = 0;
+    
+    if (this.volumeData) {
+      total += this.volumeData.byteLength;
+    }
+    
+    for (const [, block] of this.blocks) {
+      total += block.amplitude_data.byteLength;
+    }
+    
+    return total;
+  }
+  
+  async dispose(): Promise<void> {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
     }
     
     window.removeEventListener('resize', this.handleResize);
     
-    if (this.volumeMesh) {
-      this.scene.remove(this.volumeMesh);
-      this.volumeMesh.geometry.dispose();
-      if (this.volumeMaterial) {
-        this.volumeMaterial.dispose();
-      }
-    }
-    
-    if (this.volumeTexture) {
-      this.volumeTexture.dispose();
-    }
+    await this.clearVolumeData();
     
     if (this.colormapTexture) {
-      this.colormapTexture.dispose();
+      this.disposeTexture(this.colormapTexture);
+      this.colormapTexture = null;
     }
     
-    this.controls.dispose();
-    this.renderer.dispose();
+    for (const light of this.lights) {
+      try {
+        this.scene.remove(light);
+      } catch {}
+    }
+    this.lights = [];
+    
+    try {
+      this.controls.dispose();
+    } catch (error) {
+      console.warn('[VolumeRenderer] Controls dispose warning:', error);
+    }
+    
+    while (this.scene.children.length > 0) {
+      this.scene.remove(this.scene.children[0]);
+    }
+    
+    try {
+      this.renderer.dispose();
+      const gl = this.renderer.getContext();
+      if (gl) {
+        const loseContext = gl.getExtension('WEBGL_lose_context');
+        if (loseContext) {
+          loseContext.loseContext();
+        }
+      }
+    } catch (error) {
+      console.warn('[VolumeRenderer] Renderer dispose warning:', error);
+    }
     
     if (this.renderer.domElement.parentNode) {
       this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
     }
+    
+    this.trackedResources.clear();
+    
+    resourceManager.unregisterCleanupHook(`renderer_${this.groupId}`);
+    await resourceManager.disposeGroup(this.groupId, true);
+    await resourceManager.forceGC();
+    
+    console.log(`[VolumeRenderer] Disposed ${this.groupId}`);
   }
 }

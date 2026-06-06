@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { BlockInfo, BoundingBox } from '../types';
+import { resourceManager } from '../utils/ResourceManager';
 
 interface OctreeNode {
   id: string;
@@ -9,6 +10,7 @@ interface OctreeNode {
   parent: OctreeNode | null;
   blockInfo: BlockInfo | null;
   isLoaded: boolean;
+  boundsResourceId?: string;
 }
 
 export class OctreeScheduler {
@@ -19,18 +21,30 @@ export class OctreeScheduler {
   private pendingRequests: Set<string> = new Set();
   
   private maxLoadedBlocks: number = 100;
-  
   private frustum: THREE.Frustum = new THREE.Frustum();
   
-  constructor() {}
+  private groupId: string;
+  private isDisposed = false;
+  
+  constructor(groupId?: string) {
+    this.groupId = groupId || `octree_${Date.now()}`;
+    resourceManager.registerCleanupHook(`octree_${this.groupId}`, () => this.dispose());
+  }
 
-  buildFromBlocks(blocks: BlockInfo[], header: any): OctreeNode {
-    this.nodes.clear();
-    this.loadedBlocks.clear();
-    this.visibleBlocks.clear();
-    this.pendingRequests.clear();
+  buildFromBlocks(blocks: BlockInfo[], header: any): OctreeNode | null {
+    if (this.isDisposed) return null;
+    
+    this.clearInternal();
     
     const globalBounds = this.computeGlobalBounds(header);
+    resourceManager.track(
+      globalBounds,
+      'THREE.Box3',
+      24 * 4,
+      this.groupId,
+      'Global bounds'
+    );
+    
     this.root = this.buildOctreeRecursive(blocks, globalBounds, 0, null);
     
     return this.root;
@@ -51,6 +65,14 @@ export class OctreeScheduler {
   ): OctreeNode {
     const nodeId = this.generateNodeId(bounds, level);
     
+    const boundsResourceId = resourceManager.track(
+      bounds,
+      'THREE.Box3',
+      24 * 4,
+      this.groupId,
+      `Node bounds level ${level}`
+    );
+    
     const node: OctreeNode = {
       id: nodeId,
       level: level,
@@ -59,6 +81,7 @@ export class OctreeScheduler {
       parent: parent,
       blockInfo: null,
       isLoaded: false,
+      boundsResourceId,
     };
     
     this.nodes.set(nodeId, node);
@@ -92,7 +115,8 @@ export class OctreeScheduler {
       (bb.min_y + bb.max_y) / 2,
       (bb.min_z + bb.max_z) / 2
     );
-    return bounds.containsPoint(blockCenter);
+    const contains = bounds.containsPoint(blockCenter);
+    return contains;
   }
 
   private splitBounds(bounds: THREE.Box3): THREE.Box3[] {
@@ -106,7 +130,7 @@ export class OctreeScheduler {
     const midY = center.y;
     const midZ = center.z;
     
-    return [
+    const children = [
       new THREE.Box3(
         new THREE.Vector3(min.x, min.y, min.z),
         new THREE.Vector3(midX, midY, midZ)
@@ -140,6 +164,18 @@ export class OctreeScheduler {
         new THREE.Vector3(max.x, max.y, max.z)
       ),
     ];
+    
+    for (const child of children) {
+      resourceManager.track(
+        child,
+        'THREE.Box3',
+        24 * 4,
+        this.groupId,
+        'Child bounds'
+      );
+    }
+    
+    return children;
   }
 
   private generateNodeId(bounds: THREE.Box3, level: number): string {
@@ -149,6 +185,8 @@ export class OctreeScheduler {
   }
 
   updateVisibility(camera: THREE.Camera): string[] {
+    if (this.isDisposed || !this.root) return [];
+    
     this.updateFrustum(camera);
     
     this.visibleBlocks.clear();
@@ -262,12 +300,43 @@ export class OctreeScheduler {
     return this.root;
   }
 
-  clear(): void {
+  getGroupId(): string {
+    return this.groupId;
+  }
+
+  private clearInternal(): void {
+    for (const node of this.nodes.values()) {
+      if (node.boundsResourceId) {
+        resourceManager.dispose(node.boundsResourceId, true);
+      }
+      node.bounds = null as any;
+      node.blockInfo = null;
+      node.parent = null;
+      node.children = [];
+    }
+    
     this.root = null;
     this.nodes.clear();
     this.loadedBlocks.clear();
     this.visibleBlocks.clear();
     this.pendingRequests.clear();
+  }
+
+  clear(): void {
+    this.clearInternal();
+  }
+
+  async dispose(): Promise<void> {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    
+    this.clearInternal();
+    
+    resourceManager.unregisterCleanupHook(`octree_${this.groupId}`);
+    await resourceManager.disposeGroup(this.groupId, true);
+    await resourceManager.forceGC();
+    
+    console.log(`[OctreeScheduler] Disposed ${this.groupId}`);
   }
 
   static computeBoundingBox(bb: BoundingBox): THREE.Box3 {

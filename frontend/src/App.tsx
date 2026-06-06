@@ -3,14 +3,19 @@ import { VolumeRenderer } from './engine/VolumeRenderer';
 import { WebSocketClient } from './data/DataBuffer';
 import { VolumeRenderSettings, DatasetMetadata, SEGYHeader, DataBlock, ProgressUpdate } from './types';
 import { ColormapPreset } from './engine/ColormapManager';
+import { resourceManager } from './utils/ResourceManager';
+
+resourceManager.enableDebug(true);
 
 const App: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<VolumeRenderer | null>(null);
   const wsClientRef = useRef<WebSocketClient | null>(null);
+  const isSwitchingRef = useRef(false);
   
   const [isConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isSwitching, setIsSwitching] = useState(false);
   const [, setDatasetId] = useState<string | null>(null);
   const [, setMetadata] = useState<DatasetMetadata | null>(null);
   const [header, setHeader] = useState<SEGYHeader | null>(null);
@@ -30,8 +35,10 @@ const App: React.FC = () => {
   const [showControls, setShowControls] = useState(true);
   const [uploadedFiles, setUploadedFiles] = useState<{id: string; name: string; size: number}[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [memoryUsage, setMemoryUsage] = useState({ gpu: 0, cpu: 0, resources: 0 });
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cleanupCallbacksRef = useRef<Array<() => void | Promise<void>>>([]);
 
   useEffect(() => {
     if (containerRef.current && !rendererRef.current) {
@@ -46,15 +53,77 @@ const App: React.FC = () => {
       }));
     }
     
-    return () => {
+    const cleanup = async () => {
+      console.log('[App] Running cleanup...');
+      
+      for (const cb of cleanupCallbacksRef.current) {
+        try {
+          await cb();
+        } catch (e) {
+          console.error('[App] Cleanup callback error:', e);
+        }
+      }
+      cleanupCallbacksRef.current = [];
+      
+      if (wsClientRef.current) {
+        await wsClientRef.current.dispose();
+        wsClientRef.current = null;
+      }
+      
       if (rendererRef.current) {
-        rendererRef.current.dispose();
+        await rendererRef.current.dispose();
         rendererRef.current = null;
       }
+      
+      await resourceManager.disposeAll(true);
+    };
+    
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      cleanup();
+      e.preventDefault();
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    
+    const interval = setInterval(() => {
+      if (rendererRef.current) {
+        const gpuMem = rendererRef.current.getMemoryUsage();
+        const cpuMem = wsClientRef.current?.getMemoryUsage() || 0;
+        const stats = resourceManager.getStats();
+        
+        setMemoryUsage({
+          gpu: gpuMem,
+          cpu: cpuMem,
+          resources: stats.resourceCount,
+        });
+      }
+    }, 2000);
+    
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      cleanup();
     };
   }, []);
 
   useEffect(() => {
+    initializeWebSocket();
+    fetchDatasets();
+    
+    return () => {
+      if (wsClientRef.current) {
+        wsClientRef.current.dispose();
+        wsClientRef.current = null;
+      }
+    };
+  }, []);
+
+  const initializeWebSocket = useCallback(async () => {
+    if (wsClientRef.current) {
+      await wsClientRef.current.dispose();
+      wsClientRef.current = null;
+    }
+    
     const wsUrl = 'ws://localhost:8001';
     wsClientRef.current = new WebSocketClient(wsUrl);
     
@@ -70,6 +139,7 @@ const App: React.FC = () => {
     const unsubMetadata = client.onMetadata((meta) => {
       setMetadata(meta);
       setIsLoading(false);
+      setIsSwitching(false);
       
       if (rendererRef.current && meta.blocks.length > 0) {
         const octree = rendererRef.current.getOctreeScheduler();
@@ -78,7 +148,7 @@ const App: React.FC = () => {
     });
     
     const unsubBlock = client.onBlock((block: DataBlock) => {
-      if (rendererRef.current) {
+      if (rendererRef.current && !isSwitchingRef.current) {
         rendererRef.current.addBlock(block);
         const octree = rendererRef.current.getOctreeScheduler();
         octree.markBlockLoaded(block.block_id);
@@ -92,18 +162,16 @@ const App: React.FC = () => {
     const unsubError = client.onError((err) => {
       setError(err);
       setIsLoading(false);
+      setIsSwitching(false);
     });
     
-    fetchDatasets();
-    
-    return () => {
-      unsubHeader();
-      unsubMetadata();
-      unsubBlock();
-      unsubProgress();
-      unsubError();
-      client.disconnect();
-    };
+    cleanupCallbacksRef.current.push(
+      () => unsubHeader(),
+      () => unsubMetadata(),
+      () => unsubBlock(),
+      () => unsubProgress(),
+      () => unsubError(),
+    );
   }, []);
 
   const fetchDatasets = async () => {
@@ -116,9 +184,66 @@ const App: React.FC = () => {
     }
   };
 
+  const switchDataset = useCallback(async (newDatasetId: string) => {
+    if (isSwitchingRef.current) {
+      console.log('[App] Already switching dataset, skipping...');
+      return;
+    }
+    
+    isSwitchingRef.current = true;
+    setIsSwitching(true);
+    setError(null);
+    setProgress(null);
+    
+    try {
+      console.log('[App] Starting dataset switch...');
+      
+      if (wsClientRef.current) {
+        await wsClientRef.current.dispose();
+        wsClientRef.current = null;
+      }
+      
+      if (rendererRef.current) {
+        await rendererRef.current.clearVolumeData();
+      }
+      
+      setHeader(null);
+      setDatasetId(null);
+      setSelectedFile(null);
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await resourceManager.forceGC();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      const stats = resourceManager.getStats();
+      console.log(`[App] After cleanup: ${stats.resourceCount} resources, ${stats.currentUsage} bytes`);
+      
+      await initializeWebSocket();
+      
+      setDatasetId(newDatasetId);
+      setSelectedFile(newDatasetId);
+      setIsLoading(true);
+      
+      const client = wsClientRef.current as WebSocketClient | null;
+      if (client) {
+        await client.connect();
+        client.requestMetadata(newDatasetId);
+      }
+      
+    } catch (err) {
+      console.error('[App] Dataset switch failed:', err);
+      setError('Failed to switch dataset');
+      setIsLoading(false);
+      setIsSwitching(false);
+      isSwitchingRef.current = false;
+    }
+  }, [initializeWebSocket]);
+
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    
+    if (isSwitchingRef.current) return;
     
     setIsLoading(true);
     setError(null);
@@ -133,31 +258,23 @@ const App: React.FC = () => {
       });
       
       const result = await response.json();
-      setDatasetId(result.dataset_id);
-      setSelectedFile(result.dataset_id);
       
       await fetchDatasets();
-      loadDataset(result.dataset_id);
+      await switchDataset(result.dataset_id);
+      
     } catch (err) {
       setError('Failed to upload file');
       setIsLoading(false);
     }
-  };
-
-  const loadDataset = async (id: string) => {
-    setIsLoading(true);
-    setError(null);
-    setDatasetId(id);
     
-    try {
-      if (wsClientRef.current) {
-        wsClientRef.current.requestMetadata(id);
-      }
-    } catch (err) {
-      setError('Failed to load dataset');
-      setIsLoading(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
+
+  const loadDataset = useCallback(async (id: string) => {
+    await switchDataset(id);
+  }, [switchDataset]);
 
   const handleSettingChange = useCallback((key: keyof VolumeRenderSettings, value: any) => {
     setSettings(prev => {
@@ -190,83 +307,110 @@ const App: React.FC = () => {
     }
   };
 
-  const handleLoadDemoData = () => {
-    if (!rendererRef.current) return;
+  const handleLoadDemoData = async () => {
+    if (!rendererRef.current || isSwitchingRef.current) return;
     
+    isSwitchingRef.current = true;
+    setIsSwitching(true);
     setIsLoading(true);
+    setError(null);
     
-    const width = 64;
-    const height = 64;
-    const depth = 64;
-    const data = new Float32Array(width * height * depth);
-    
-    for (let z = 0; z < depth; z++) {
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const idx = z * width * height + y * width + x;
-          
-          const nx = x / width - 0.5;
-          const ny = y / height - 0.5;
-          const nz = z / depth - 0.5;
-          
-          const dist = Math.sqrt(nx * nx + ny * ny + nz * nz);
-          const layers = Math.sin(z * 0.3) * 0.3 + 0.5;
-          const noise = (Math.random() - 0.5) * 0.1;
-          
-          let value = 0.0;
-          if (dist < 0.4) {
-            value = layers * (1 - dist / 0.4) + noise;
+    try {
+      if (wsClientRef.current) {
+        await wsClientRef.current.dispose();
+        wsClientRef.current = null;
+      }
+      
+      await rendererRef.current.clearVolumeData();
+      
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await resourceManager.forceGC();
+      
+      const width = 64;
+      const height = 64;
+      const depth = 64;
+      const data = new Float32Array(width * height * depth);
+      
+      for (let z = 0; z < depth; z++) {
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const idx = z * width * height + y * width + x;
+            
+            const nx = x / width - 0.5;
+            const ny = y / height - 0.5;
+            const nz = z / depth - 0.5;
+            
+            const dist = Math.sqrt(nx * nx + ny * ny + nz * nz);
+            const layers = Math.sin(z * 0.3) * 0.3 + 0.5;
+            const noise = (Math.random() - 0.5) * 0.1;
+            
+            let value = 0.0;
+            if (dist < 0.4) {
+              value = layers * (1 - dist / 0.4) + noise;
+            }
+            
+            const horizon1 = Math.exp(-Math.pow((y / height - 0.3 + Math.sin(x * 0.1) * 0.1), 2) / 0.01) * 0.5;
+            const horizon2 = Math.exp(-Math.pow((y / height - 0.6 + Math.cos(x * 0.08) * 0.08), 2) / 0.008) * 0.4;
+            
+            value += horizon1 + horizon2;
+            
+            data[idx] = Math.max(-1, Math.min(1, value));
           }
-          
-          const horizon1 = Math.exp(-Math.pow((y / height - 0.3 + Math.sin(x * 0.1) * 0.1), 2) / 0.01) * 0.5;
-          const horizon2 = Math.exp(-Math.pow((y / height - 0.6 + Math.cos(x * 0.08) * 0.08), 2) / 0.008) * 0.4;
-          
-          value += horizon1 + horizon2;
-          
-          data[idx] = Math.max(-1, Math.min(1, value));
         }
       }
+      
+      const demoHeader: SEGYHeader = {
+        job_id: 0,
+        line_number: 0,
+        reel_number: 0,
+        num_traces: width * height,
+        num_aux_traces: 0,
+        sample_interval: 1000,
+        sample_interval_original: 1000,
+        num_samples: depth,
+        num_samples_original: depth,
+        data_sample_format: 5,
+        ensemble_fold: 1,
+        trace_sorting: 0,
+        measurement_system: 1,
+        coordinate_units: 1,
+        num_priority: 0,
+        min_x: 0,
+        max_x: width,
+        min_y: 0,
+        max_y: height,
+        min_z: 0,
+        max_z: depth,
+        inline_min: 0,
+        inline_max: width - 1,
+        xline_min: 0,
+        xline_max: height - 1,
+        inline_step: 1,
+        xline_step: 1,
+      };
+      
+      rendererRef.current.setVolumeData(data, width, height, depth, demoHeader);
+      setHeader(demoHeader);
+      
+    } finally {
+      setIsLoading(false);
+      setIsSwitching(false);
+      isSwitchingRef.current = false;
     }
-    
-    const demoHeader: SEGYHeader = {
-      job_id: 0,
-      line_number: 0,
-      reel_number: 0,
-      num_traces: width * height,
-      num_aux_traces: 0,
-      sample_interval: 1000,
-      sample_interval_original: 1000,
-      num_samples: depth,
-      num_samples_original: depth,
-      data_sample_format: 5,
-      ensemble_fold: 1,
-      trace_sorting: 0,
-      measurement_system: 1,
-      coordinate_units: 1,
-      num_priority: 0,
-      min_x: 0,
-      max_x: width,
-      min_y: 0,
-      max_y: height,
-      min_z: 0,
-      max_z: depth,
-      inline_min: 0,
-      inline_max: width - 1,
-      xline_min: 0,
-      xline_max: height - 1,
-      inline_step: 1,
-      xline_step: 1,
-    };
-    
-    rendererRef.current.setVolumeData(data, width, height, depth, demoHeader);
-    setHeader(demoHeader);
-    setIsLoading(false);
   };
 
   const colormapPresets: ColormapPreset[] = [
     'seismic', 'gray', 'viridis', 'plasma', 'inferno',
     'magma', 'cividis', 'coolwarm', 'ocean', 'terrain', 'jet', 'rainbow'
   ];
+
+  const formatBytes = (bytes: number): string => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
 
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
@@ -291,6 +435,24 @@ const App: React.FC = () => {
           }}>
             {isConnected ? '● Connected' : '○ Disconnected'}
           </span>
+          
+          {isSwitching && (
+            <span style={{
+              padding: '4px 10px',
+              borderRadius: '12px',
+              fontSize: '12px',
+              background: 'rgba(255, 193, 7, 0.2)',
+              color: '#ffc107',
+            }}>
+              ⏳ Switching Dataset...
+            </span>
+          )}
+          
+          <div style={{ display: 'flex', gap: '12px', fontSize: '11px', color: '#888' }}>
+            <span>GPU: {formatBytes(memoryUsage.gpu)}</span>
+            <span>CPU: {formatBytes(memoryUsage.cpu)}</span>
+            <span>Resources: {memoryUsage.resources}</span>
+          </div>
         </div>
         
         <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
@@ -346,10 +508,12 @@ const App: React.FC = () => {
                 accept=".sgy,.segy"
                 onChange={handleFileUpload}
                 style={{ display: 'none' }}
+                disabled={isSwitching}
               />
               
               <button
                 onClick={() => fileInputRef.current?.click()}
+                disabled={isSwitching || isLoading}
                 style={{
                   width: '100%',
                   padding: '10px',
@@ -357,10 +521,11 @@ const App: React.FC = () => {
                   border: 'none',
                   background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
                   color: '#fff',
-                  cursor: 'pointer',
+                  cursor: (isSwitching || isLoading) ? 'not-allowed' : 'pointer',
                   fontSize: '13px',
                   fontWeight: 500,
                   marginBottom: '10px',
+                  opacity: (isSwitching || isLoading) ? 0.5 : 1,
                 }}
               >
                 📁 Upload SEG-Y File
@@ -368,7 +533,7 @@ const App: React.FC = () => {
               
               <button
                 onClick={handleLoadDemoData}
-                disabled={isLoading}
+                disabled={isLoading || isSwitching}
                 style={{
                   width: '100%',
                   padding: '10px',
@@ -376,9 +541,9 @@ const App: React.FC = () => {
                   border: '1px solid rgba(255,255,255,0.2)',
                   background: 'rgba(255,255,255,0.05)',
                   color: '#fff',
-                  cursor: isLoading ? 'not-allowed' : 'pointer',
+                  cursor: (isLoading || isSwitching) ? 'not-allowed' : 'pointer',
                   fontSize: '13px',
-                  opacity: isLoading ? 0.5 : 1,
+                  opacity: (isLoading || isSwitching) ? 0.5 : 1,
                 }}
               >
                 {isLoading ? 'Loading...' : '🎯 Load Demo Data'}
@@ -393,6 +558,7 @@ const App: React.FC = () => {
                     <button
                       key={file.id}
                       onClick={() => loadDataset(file.id)}
+                      disabled={isSwitching}
                       style={{
                         width: '100%',
                         padding: '8px',
@@ -401,9 +567,10 @@ const App: React.FC = () => {
                         border: selectedFile === file.id ? '1px solid #667eea' : '1px solid rgba(255,255,255,0.1)',
                         background: selectedFile === file.id ? 'rgba(102, 126, 234, 0.2)' : 'rgba(255,255,255,0.05)',
                         color: '#fff',
-                        cursor: 'pointer',
+                        cursor: isSwitching ? 'not-allowed' : 'pointer',
                         fontSize: '12px',
                         textAlign: 'left',
+                        opacity: isSwitching ? 0.5 : 1,
                       }}
                     >
                       {file.name}
@@ -545,7 +712,7 @@ const App: React.FC = () => {
           <span>🖱️ Scroll: Zoom</span>
         </div>
         <div>
-          Seismic Strata Visualization Engine v1.0
+          Seismic Strata Visualization Engine v1.0 | Memory-Safe Mode
         </div>
       </div>
     </div>
