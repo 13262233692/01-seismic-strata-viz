@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package seismic;
+
+message SEGYHeader {
+  int32 job_id = 1;
+  int32 line_number = 2;
+  int32 reel_number = 3;
+  int32 num_traces = 4;
+  int32 num_aux_traces = 5;
+  int32 sample_interval = 6;
+  int32 sample_interval_original = 7;
+  int32 num_samples = 8;
+  int32 num_samples_original = 9;
+  int32 data_sample_format = 10;
+  int32 ensemble_fold = 11;
+  int32 trace_sorting = 12;
+  int32 measurement_system = 13;
+  int32 coordinate_units = 14;
+  int32 num_priority = 15;
+  double min_x = 16;
+  double max_x = 17;
+  double min_y = 18;
+  double max_y = 19;
+  double min_z = 20;
+  double max_z = 21;
+  int32 inline_min = 22;
+  int32 inline_max = 23;
+  int32 xline_min = 24;
+  int32 xline_max = 25;
+  int32 inline_step = 26;
+  int32 xline_step = 27;
+}
+
+message DataBlock {
+  string block_id = 1;
+  int32 level = 2;
+  int32 inline_start = 3;
+  int32 inline_end = 4;
+  int32 xline_start = 5;
+  int32 xline_end = 6;
+  int32 depth_start = 7;
+  int32 depth_end = 8;
+  int32 num_inline = 9;
+  int32 num_xline = 10;
+  int32 num_depth = 11;
+  bytes amplitude_data = 12;
+  float min_amplitude = 13;
+  float max_amplitude = 14;
+  BoundingBox bounding_box = 15;
+}
+
+message BoundingBox {
+  double min_x = 1;
+  double max_x = 2;
+  double min_y = 3;
+  double max_y = 4;
+  double min_z = 5;
+  double max_z = 6;
+}
+
+message WebSocketMessage {
+  enum MessageType {
+    HEADER = 0;
+    DATA_BLOCK = 1;
+    METADATA = 2;
+    PROGRESS = 3;
+    ERROR = 4;
+    COMPLETE = 5;
+    REQUEST_BLOCK = 6;
+    VIEW_FRUSTUM = 7;
+  }
+  
+  MessageType type = 1;
+  string request_id = 2;
+  oneof payload {
+    SEGYHeader header = 3;
+    DataBlock data_block = 4;
+    DatasetMetadata metadata = 5;
+    ProgressUpdate progress = 6;
+    ErrorMessage error = 7;
+    BlockRequest block_request = 8;
+    ViewFrustum view_frustum = 9;
+  }
+}
+
+message DatasetMetadata {
+  string dataset_id = 1;
+  string name = 2;
+  int64 file_size = 3;
+  SEGYHeader header = 4;
+  repeated BlockInfo blocks = 5;
+}
+
+message BlockInfo {
+  string block_id = 1;
+  int32 level = 2;
+  BoundingBox bounding_box = 3;
+  int64 data_size = 4;
+}
+
+message ProgressUpdate {
+  float percent_complete = 1;
+  string message = 2;
+  int64 bytes_processed = 3;
+  int64 total_bytes = 4;
+}
+
+message ErrorMessage {
+  int32 code = 1;
+  string message = 2;
+  string details = 3;
+}
+
+message BlockRequest {
+  repeated string block_ids = 1;
+  int32 level = 2;
+  bool stream = 3;
+}
+
+message ViewFrustum {
+  repeated double matrix = 1;
+  double fov = 2;
+  double aspect = 3;
+  double near = 4;
+  double far = 5;
+}
