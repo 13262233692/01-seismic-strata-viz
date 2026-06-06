@@ -4,6 +4,8 @@ import { DataBlock, VolumeRenderSettings, SEGYHeader } from '../types';
 import { ColormapManager } from './ColormapManager';
 import { OctreeScheduler } from './OctreeScheduler';
 import { resourceManager } from '../utils/ResourceManager';
+import { ClippingPlane } from '../utils/ClippingPlane';
+import { PlaneInteractor } from '../utils/PlaneInteractor';
 
 const vertexShader = `
 uniform mat4 modelViewMatrix;
@@ -48,9 +50,22 @@ uniform vec3 uBoundsMax;
 uniform float uMinValue;
 uniform float uMaxValue;
 
+uniform bool uEnableClipping;
+uniform vec3 uClipPlaneNormal;
+uniform float uClipPlaneConstant;
+
 varying vec3 vWorldPosition;
 varying vec3 vLocalPosition;
 varying vec2 vUv;
+
+float distanceToPlane(vec3 point, vec3 normal, float constant) {
+  return dot(normal, point) + constant;
+}
+
+bool isBehindClipPlane(vec3 point) {
+  if (!uEnableClipping) return false;
+  return distanceToPlane(point, uClipPlaneNormal, uClipPlaneConstant) > 0.001;
+}
 
 bool intersectBox(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float tNear, out float tFar) {
   vec3 invR = 1.0 / rd;
@@ -63,6 +78,13 @@ bool intersectBox(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float tNear, o
   t = min(tmax.xx, tmax.yz);
   tFar = min(t.x, t.y);
   return tNear < tFar && tFar > 0.0;
+}
+
+bool intersectRayPlane(vec3 ro, vec3 rd, vec3 planeNormal, float planeConstant, out float t) {
+  float denom = dot(planeNormal, rd);
+  if (abs(denom) < 1e-6) return false;
+  t = -(dot(planeNormal, ro) + planeConstant) / denom;
+  return t >= 0.0;
 }
 
 vec3 localToUvw(vec3 localPos, vec3 boundsMin, vec3 boundsMax) {
@@ -102,6 +124,23 @@ void main() {
   vec3 startPos = ro + rd * tNear;
   vec3 endPos = ro + rd * tFar;
   
+  if (uEnableClipping) {
+    float tPlane;
+    if (intersectRayPlane(ro, rd, uClipPlaneNormal, uClipPlaneConstant, tPlane)) {
+      if (tPlane > tNear && tPlane < tFar) {
+        if (isBehindClipPlane(startPos)) {
+          startPos = ro + rd * tPlane;
+        } else {
+          endPos = ro + rd * tPlane;
+        }
+      }
+    }
+    
+    if (isBehindClipPlane(startPos) && isBehindClipPlane(endPos)) {
+      discard;
+    }
+  }
+  
   float stepSize = uSampleRate * 0.5;
   vec3 step = rd * stepSize;
   
@@ -116,6 +155,11 @@ void main() {
   for (int i = 0; i < 512; i++) {
     if (i >= maxSteps) break;
     if (accumulatedColor.a >= 0.95) break;
+    
+    if (isBehindClipPlane(currentPos)) {
+      currentPos += step;
+      continue;
+    }
     
     vec3 uvw = localToUvw(currentPos, uBoundsMin, uBoundsMax);
     float density = sampleVolume(uvw);
@@ -183,6 +227,10 @@ export class VolumeRenderer {
   private isClearing = false;
   
   private lights: THREE.Light[] = [];
+  
+  private clippingEnabled = false;
+  private planeInteractor: PlaneInteractor | null = null;
+  private fpsCounter = { frames: 0, lastTime: performance.now(), currentFps: 60 };
   
   constructor(options: VolumeRendererOptions) {
     this.container = options.container;
@@ -295,6 +343,15 @@ export class VolumeRenderer {
     if (this.isDisposed) return;
     
     this.animationFrameId = requestAnimationFrame(this.animate);
+    
+    this.fpsCounter.frames++;
+    const now = performance.now();
+    if (now - this.fpsCounter.lastTime >= 1000) {
+      this.fpsCounter.currentFps = this.fpsCounter.frames;
+      this.fpsCounter.frames = 0;
+      this.fpsCounter.lastTime = now;
+    }
+    
     this.controls.update();
     this.updateUniforms();
     this.render();
@@ -592,6 +649,9 @@ export class VolumeRenderer {
       uBoundsMax: { value: new THREE.Vector3(0.5, 0.5, 0.5) },
       uMinValue: { value: this.valueRange.min },
       uMaxValue: { value: this.valueRange.max },
+      uEnableClipping: { value: false },
+      uClipPlaneNormal: { value: new THREE.Vector3(0, 0, 1) },
+      uClipPlaneConstant: { value: 0.0 },
     };
     
     this.volumeMaterial = new THREE.ShaderMaterial({
@@ -628,6 +688,57 @@ export class VolumeRenderer {
     }
     
     this.scene.add(this.volumeMesh);
+    
+    this.initPlaneInteractor();
+  }
+  
+  private initPlaneInteractor(): void {
+    if (!this.volumeMesh || this.isDisposed) return;
+    
+    if (this.planeInteractor) {
+      this.planeInteractor.dispose();
+      this.planeInteractor = null;
+    }
+    
+    const box = new THREE.Box3().setFromObject(this.volumeMesh);
+    
+    this.planeInteractor = new PlaneInteractor({
+      scene: this.scene,
+      camera: this.camera,
+      domElement: this.renderer.domElement,
+      bounds: box,
+      groupId: this.groupId,
+    });
+    
+    this.planeInteractor.visible = false;
+    this.planeInteractor.enabled = false;
+    
+    this.planeInteractor.onChange((plane) => {
+      this.updateClipPlaneUniforms(plane);
+    });
+  }
+  
+  private updateClipPlaneUniforms(plane: ClippingPlane): void {
+    if (!this.volumeMaterial || this.isDisposed) return;
+    
+    const uniforms = this.volumeMaterial.uniforms;
+    
+    if (this.volumeMesh) {
+      const inverseMatrix = new THREE.Matrix4().copy(this.volumeMesh.matrixWorld).invert();
+      const localNormal = plane.normal.clone().applyMatrix4(inverseMatrix).normalize();
+      
+      const worldOrigin = plane.origin.clone();
+      const localOrigin = worldOrigin.clone().applyMatrix4(inverseMatrix);
+      const localConstant = -localOrigin.dot(localNormal);
+      
+      uniforms.uClipPlaneNormal.value.copy(localNormal);
+      uniforms.uClipPlaneConstant.value = localConstant;
+    } else {
+      uniforms.uClipPlaneNormal.value.copy(plane.normal);
+      uniforms.uClipPlaneConstant.value = plane.constant;
+    }
+    
+    uniforms.uEnableClipping.value = this.clippingEnabled;
   }
   
   private updateCameraPosition(): void {
@@ -726,6 +837,70 @@ export class VolumeRenderer {
     return total;
   }
   
+  getFps(): number {
+    return this.fpsCounter.currentFps;
+  }
+  
+  enableClipping(enable: boolean): void {
+    if (this.isDisposed) return;
+    
+    this.clippingEnabled = enable;
+    
+    if (this.planeInteractor) {
+      this.planeInteractor.enabled = enable;
+      this.planeInteractor.visible = enable;
+    }
+    
+    if (this.volumeMaterial) {
+      this.volumeMaterial.uniforms.uEnableClipping.value = enable;
+    }
+    
+    if (enable && this.planeInteractor) {
+      this.updateClipPlaneUniforms(this.planeInteractor.plane);
+    }
+  }
+  
+  isClippingEnabled(): boolean {
+    return this.clippingEnabled;
+  }
+  
+  getPlaneInteractor(): PlaneInteractor | null {
+    return this.planeInteractor;
+  }
+  
+  setClipPlaneNormal(normal: THREE.Vector3): void {
+    if (!this.planeInteractor || this.isDisposed) return;
+    
+    const plane = this.planeInteractor.plane;
+    plane.setNormal(normal);
+    this.updateClipPlaneUniforms(plane);
+  }
+  
+  setClipPlaneOffset(offset: number): void {
+    if (!this.planeInteractor || this.isDisposed) return;
+    
+    const plane = this.planeInteractor.plane;
+    const center = new THREE.Vector3();
+    if (this.volumeMesh) {
+      const box = new THREE.Box3().setFromObject(this.volumeMesh);
+      box.getCenter(center);
+    }
+    
+    plane.setFromNormalAndCoplanarPoint(
+      plane.normal,
+      center.clone().add(plane.normal.clone().multiplyScalar(offset))
+    );
+    
+    this.updateClipPlaneUniforms(plane);
+  }
+  
+  resetClipPlane(): void {
+    if (!this.planeInteractor || this.isDisposed) return;
+    
+    this.planeInteractor.reset();
+    this.updateClipPlaneUniforms(this.planeInteractor.plane);
+  }
+  
   async dispose(): Promise<void> {
     if (this.isDisposed) return;
     this.isDisposed = true;
@@ -736,6 +911,11 @@ export class VolumeRenderer {
     }
     
     window.removeEventListener('resize', this.handleResize);
+    
+    if (this.planeInteractor) {
+      await this.planeInteractor.dispose();
+      this.planeInteractor = null;
+    }
     
     await this.clearVolumeData();
     

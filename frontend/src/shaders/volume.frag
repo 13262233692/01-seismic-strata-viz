@@ -17,9 +17,22 @@ uniform vec3 uBoundsMax;
 uniform float uMinValue;
 uniform float uMaxValue;
 
+uniform bool uEnableClipping;
+uniform vec3 uClipPlaneNormal;
+uniform float uClipPlaneConstant;
+
 varying vec3 vWorldPosition;
 varying vec3 vLocalPosition;
 varying vec2 vUv;
+
+float distanceToPlane(vec3 point, vec3 normal, float constant) {
+  return dot(normal, point) + constant;
+}
+
+bool isBehindClipPlane(vec3 point) {
+  if (!uEnableClipping) return false;
+  return distanceToPlane(point, uClipPlaneNormal, uClipPlaneConstant) > 0.001;
+}
 
 bool intersectBox(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float tNear, out float tFar) {
   vec3 invR = 1.0 / rd;
@@ -32,6 +45,13 @@ bool intersectBox(vec3 ro, vec3 rd, vec3 boxMin, vec3 boxMax, out float tNear, o
   t = min(tmax.xx, tmax.yz);
   tFar = min(t.x, t.y);
   return tNear < tFar && tFar > 0.0;
+}
+
+bool intersectRayPlane(vec3 ro, vec3 rd, vec3 planeNormal, float planeConstant, out float t) {
+  float denom = dot(planeNormal, rd);
+  if (abs(denom) < 1e-6) return false;
+  t = -(dot(planeNormal, ro) + planeConstant) / denom;
+  return t >= 0.0;
 }
 
 vec3 localToUvw(vec3 localPos, vec3 boundsMin, vec3 boundsMax) {
@@ -71,6 +91,23 @@ void main() {
   vec3 startPos = ro + rd * tNear;
   vec3 endPos = ro + rd * tFar;
   
+  if (uEnableClipping) {
+    float tPlane;
+    if (intersectRayPlane(ro, rd, uClipPlaneNormal, uClipPlaneConstant, tPlane)) {
+      if (tPlane > tNear && tPlane < tFar) {
+        if (isBehindClipPlane(startPos)) {
+          startPos = ro + rd * tPlane;
+        } else {
+          endPos = ro + rd * tPlane;
+        }
+      }
+    }
+    
+    if (isBehindClipPlane(startPos) && isBehindClipPlane(endPos)) {
+      discard;
+    }
+  }
+  
   float stepSize = uSampleRate * 0.5;
   vec3 step = rd * stepSize;
   
@@ -85,6 +122,11 @@ void main() {
   for (int i = 0; i < 512; i++) {
     if (i >= maxSteps) break;
     if (accumulatedColor.a >= 0.95) break;
+    
+    if (isBehindClipPlane(currentPos)) {
+      currentPos += step;
+      continue;
+    }
     
     vec3 uvw = localToUvw(currentPos, uBoundsMin, uBoundsMax);
     float density = sampleVolume(uvw);

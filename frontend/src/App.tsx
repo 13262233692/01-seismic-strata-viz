@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import * as THREE from 'three';
 import { VolumeRenderer } from './engine/VolumeRenderer';
 import { WebSocketClient } from './data/DataBuffer';
 import { VolumeRenderSettings, DatasetMetadata, SEGYHeader, DataBlock, ProgressUpdate } from './types';
@@ -36,6 +37,11 @@ const App: React.FC = () => {
   const [uploadedFiles, setUploadedFiles] = useState<{id: string; name: string; size: number}[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [memoryUsage, setMemoryUsage] = useState({ gpu: 0, cpu: 0, resources: 0 });
+  
+  const [clippingEnabled, setClippingEnabled] = useState(false);
+  const [clipPlaneNormal, setClipPlaneNormal] = useState({ x: 0, y: 0, z: 1 });
+  const [clipPlaneOffset, setClipPlaneOffset] = useState(0);
+  const [currentFps, setCurrentFps] = useState(60);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cleanupCallbacksRef = useRef<Array<() => void | Promise<void>>>([]);
@@ -90,12 +96,14 @@ const App: React.FC = () => {
         const gpuMem = rendererRef.current.getMemoryUsage();
         const cpuMem = wsClientRef.current?.getMemoryUsage() || 0;
         const stats = resourceManager.getStats();
+        const fps = rendererRef.current.getFps();
         
         setMemoryUsage({
           gpu: gpuMem,
           cpu: cpuMem,
           resources: stats.resourceCount,
         });
+        setCurrentFps(fps);
       }
     }, 2000);
     
@@ -307,6 +315,37 @@ const App: React.FC = () => {
     }
   };
 
+  const handleClippingToggle = (enabled: boolean) => {
+    setClippingEnabled(enabled);
+    if (rendererRef.current) {
+      rendererRef.current.enableClipping(enabled);
+    }
+  };
+
+  const handleClipPlaneNormalChange = (axis: 'x' | 'y' | 'z', value: number) => {
+    const newNormal = { ...clipPlaneNormal, [axis]: value };
+    setClipPlaneNormal(newNormal);
+    if (rendererRef.current) {
+      const normal = new THREE.Vector3(newNormal.x, newNormal.y, newNormal.z).normalize();
+      rendererRef.current.setClipPlaneNormal(normal);
+    }
+  };
+
+  const handleClipPlaneOffsetChange = (offset: number) => {
+    setClipPlaneOffset(offset);
+    if (rendererRef.current) {
+      rendererRef.current.setClipPlaneOffset(offset);
+    }
+  };
+
+  const handleResetClipPlane = () => {
+    setClipPlaneNormal({ x: 0, y: 0, z: 1 });
+    setClipPlaneOffset(0);
+    if (rendererRef.current) {
+      rendererRef.current.resetClipPlane();
+    }
+  };
+
   const handleLoadDemoData = async () => {
     if (!rendererRef.current || isSwitchingRef.current) return;
     
@@ -452,6 +491,12 @@ const App: React.FC = () => {
             <span>GPU: {formatBytes(memoryUsage.gpu)}</span>
             <span>CPU: {formatBytes(memoryUsage.cpu)}</span>
             <span>Resources: {memoryUsage.resources}</span>
+            <span style={{ 
+              color: currentFps >= 45 ? '#4caf50' : currentFps >= 30 ? '#ffc107' : '#f44336',
+              fontWeight: 600
+            }}>
+              FPS: {currentFps}
+            </span>
           </div>
         </div>
         
@@ -662,6 +707,115 @@ const App: React.FC = () => {
               ))}
             </div>
             
+            <div style={{ marginBottom: '24px' }}>
+              <h3 style={{ margin: '0 0 12px 0', fontSize: '14px', color: '#aaa', fontWeight: 600 }}>
+                ✂️ CLIPPING PLANE
+              </h3>
+              
+              <div style={{ marginBottom: '12px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '12px', color: '#ccc' }}>
+                  <input
+                    type="checkbox"
+                    checked={clippingEnabled}
+                    onChange={(e) => handleClippingToggle(e.target.checked)}
+                    style={{ accentColor: '#667eea' }}
+                  />
+                  Enable Clipping Plane
+                </label>
+              </div>
+              
+              {clippingEnabled && (
+                <>
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '12px', color: '#ccc' }}>Plane Normal (X)</span>
+                      <span style={{ fontSize: '12px', color: '#888' }}>{clipPlaneNormal.x.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-1"
+                      max="1"
+                      step="0.05"
+                      value={clipPlaneNormal.x}
+                      onChange={(e) => handleClipPlaneNormalChange('x', parseFloat(e.target.value))}
+                      style={{ width: '100%', accentColor: '#ff4444' }}
+                    />
+                  </div>
+                  
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '12px', color: '#ccc' }}>Plane Normal (Y)</span>
+                      <span style={{ fontSize: '12px', color: '#888' }}>{clipPlaneNormal.y.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-1"
+                      max="1"
+                      step="0.05"
+                      value={clipPlaneNormal.y}
+                      onChange={(e) => handleClipPlaneNormalChange('y', parseFloat(e.target.value))}
+                      style={{ width: '100%', accentColor: '#44ff44' }}
+                    />
+                  </div>
+                  
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '12px', color: '#ccc' }}>Plane Normal (Z)</span>
+                      <span style={{ fontSize: '12px', color: '#888' }}>{clipPlaneNormal.z.toFixed(2)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-1"
+                      max="1"
+                      step="0.05"
+                      value={clipPlaneNormal.z}
+                      onChange={(e) => handleClipPlaneNormalChange('z', parseFloat(e.target.value))}
+                      style={{ width: '100%', accentColor: '#4444ff' }}
+                    />
+                  </div>
+                  
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '12px', color: '#ccc' }}>Plane Offset</span>
+                      <span style={{ fontSize: '12px', color: '#888' }}>{clipPlaneOffset.toFixed(1)}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="-100"
+                      max="100"
+                      step="1"
+                      value={clipPlaneOffset}
+                      onChange={(e) => handleClipPlaneOffsetChange(parseFloat(e.target.value))}
+                      style={{ width: '100%', accentColor: '#ffff00' }}
+                    />
+                  </div>
+                  
+                  <button
+                    onClick={handleResetClipPlane}
+                    style={{
+                      width: '100%',
+                      padding: '8px',
+                      borderRadius: '4px',
+                      border: '1px solid rgba(255,255,255,0.2)',
+                      background: 'rgba(255,255,255,0.05)',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    🔄 Reset Plane
+                  </button>
+                  
+                  <div style={{ marginTop: '10px', padding: '8px', fontSize: '11px', color: '#666', lineHeight: 1.5 }}>
+                    💡 <strong>Tips:</strong><br/>
+                    • Drag yellow arrow handles to move plane<br/>
+                    • Drag colored arcs to rotate plane<br/>
+                    • Ctrl+Scroll to adjust plane depth
+                  </div>
+                </>
+              )}
+            </div>
+            
             {header && (
               <div style={{ marginBottom: '24px' }}>
                 <h3 style={{ margin: '0 0 12px 0', fontSize: '14px', color: '#aaa', fontWeight: 600 }}>
@@ -709,7 +863,10 @@ const App: React.FC = () => {
         <div>
           <span style={{ marginRight: '16px' }}>🖱️ Left Drag: Rotate</span>
           <span style={{ marginRight: '16px' }}>🖱️ Right Drag: Pan</span>
-          <span>🖱️ Scroll: Zoom</span>
+          <span style={{ marginRight: '16px' }}>🖱️ Scroll: Zoom</span>
+          {clippingEnabled && (
+            <span style={{ color: '#00aaff' }}>✂️ Clipping Mode Active</span>
+          )}
         </div>
         <div>
           Seismic Strata Visualization Engine v1.0 | Memory-Safe Mode
